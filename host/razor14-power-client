@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+"""Client for the optional local power service; no privileged operations."""
+import json
+import socket
+import sys
+command = sys.argv[1] if len(sys.argv) > 1 else 'status'
+if command not in ('status', 'auto', 'save'):
+    raise SystemExit('Expected status, auto or save')
+try:
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(60)
+        s.connect('/run/razor14-power/control.sock')
+        s.sendall(command.encode())
+        print(s.recv(65536).decode())
+except OSError:
+    print(json.dumps(dict(active=False, requested=False, available=False,
+                         error='Full-save-Dienst nicht erreichbar.')))

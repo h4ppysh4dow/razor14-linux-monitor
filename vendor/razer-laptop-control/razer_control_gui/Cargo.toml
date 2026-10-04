@@ -1,0 +1,54 @@
+[package]
+name = "service"
+version = "0.2.0"
+authors = ["Dimitar Atanasov <datanasov@cpdbg.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+
+[[bin]]
+name = "razer-cli"
+path = "src/cli/cli.rs"
+
+[[bin]]
+name = "daemon"
+path = "src/daemon/daemon.rs"
+
+[[bin]]
+name = "razer-settings"
+path = "src/razer-settings/razer-settings.rs"
+
+# [[bin]]
+# name = "gui"
+# path = "src/gui.rs"
+
+[lints.rust]
+# Allow this for now
+dead_code = "allow"
+
+[lints.clippy]
+get_first = "allow"
+# Allow this for now
+collapsible_match = "allow" # 3?
+permissions_set_readonly_false = "allow" #1
+single_match = "allow" #2
+unnecessary_map_or = "allow" # 2
+manual_memcpy = "allow" # 2
+new_ret_no_self = "allow" #1
+
+[dependencies]
+razer-laptop = { path = "../crates/razer-laptop" }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+dbus = "0.9.7"
+serde_json = "1.0"
+signal-hook = "0.3.17"
+rand = "0.8.5"
+systemstat = "0.2.3"
+clap = { version = "4.4.13", features = ["derive"] }
+gtk = "0.18.1"
+glib = "0.19.7"

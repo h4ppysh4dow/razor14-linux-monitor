@@ -1,0 +1,501 @@
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
+
+#[path = "../comms.rs"]
+mod comms;
+mod args;
+
+use args::*;
+use razer_laptop::razer_devices;
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.args {
+        Args::Read { attr } => match attr {
+            ReadAttr::ActualFan => {
+                match send_data(comms::DaemonCommand::GetActualFanSpeed) {
+                    Some(comms::DaemonResponse::GetActualFanSpeed { rpm }) => println!("TACHOMETER_JSON:{}", serde_json::to_string(&rpm).unwrap()),
+                    _ => { eprintln!("Tachometer read failed"); std::process::exit(1); }
+                }
+            },
+            ReadAttr::Fan(AcStateParam { ac_state }) => read_fan_rpm(ac_state as usize),
+            ReadAttr::Power(AcStateParam { ac_state }) => read_power_mode(ac_state as usize),
+            ReadAttr::Brightness(AcStateParam { ac_state }) => read_brightness(ac_state as usize),
+            ReadAttr::Logo(AcStateParam { ac_state }) => read_logo_mode(ac_state as usize),
+            ReadAttr::Sync => read_sync(),
+            ReadAttr::Bho => read_bho(),
+            ReadAttr::LightControl => read_light_control(),
+        },
+        Args::Write { attr } => match attr {
+            WriteAttr::Fan(FanParams { ac_state, speed }) => {
+                write_fan_speed(ac_state as usize, speed)
+            }
+            WriteAttr::Power(PowerParams {
+                ac_state,
+                pwr,
+                cpu_mode,
+                gpu_mode,
+            }) => write_pwr_mode(ac_state as usize, pwr, cpu_mode, gpu_mode),
+            WriteAttr::Brightness(BrightnessParams {
+                ac_state,
+                brightness,
+            }) => write_brightness(ac_state as usize, brightness as u8),
+            WriteAttr::Sync(SyncParams { sync_state }) => write_sync(sync_state.is_on()),
+            WriteAttr::Logo(LogoParams {
+                ac_state,
+                logo_state,
+            }) => write_logo_mode(ac_state as usize, logo_state as u8),
+            WriteAttr::Bho(BhoParams { state, threshold }) => {
+                validate_and_write_bho(threshold, state)
+            },
+            WriteAttr::LightControl(LightControlParams { enable }) => {
+                write_light_control(enable.is_on())
+            }
+        },
+        Args::Effect { effect } => match effect {
+            Effect::Static(params) => send_effect(
+                "static".to_string(),
+                vec![params.red, params.green, params.blue],
+            ),
+            Effect::StaticGradient(params) => send_effect(
+                "static_gradient".to_string(),
+                vec![
+                    params.red1,
+                    params.green1,
+                    params.blue1,
+                    params.red2,
+                    params.green2,
+                    params.blue2,
+                ],
+            ),
+            Effect::WaveGradient(params) => send_effect(
+                "wave_gradient".to_string(),
+                vec![
+                    params.red1,
+                    params.green1,
+                    params.blue1,
+                    params.red2,
+                    params.green2,
+                    params.blue2,
+                ],
+            ),
+            Effect::BreathingSingle(params) => send_effect(
+                "breathing_single".to_string(),
+                vec![params.red, params.green, params.blue, params.duration],
+            ),
+        },
+        Args::StandardEffect { effect } => match effect {
+            StandardEffect::Off => send_standard_effect("off".to_string(), vec![]),
+            StandardEffect::Spectrum => send_standard_effect("spectrum".to_string(), vec![]),
+            StandardEffect::Breathing(params) => send_standard_effect(
+                "breathing".to_string(),
+                vec![
+                    params.kind,
+                    params.red1,
+                    params.green1,
+                    params.blue1,
+                    params.red2,
+                    params.green2,
+                    params.blue2,
+                ],
+            ),
+            StandardEffect::Reactive(params) => send_standard_effect(
+                "reactive".to_string(),
+                vec![params.speed, params.red, params.green, params.blue],
+            ),
+            StandardEffect::Starlight(params) => send_standard_effect(
+                "starlight".to_string(),
+                vec![
+                    params.kind,
+                    params.speed,
+                    params.red1,
+                    params.green1,
+                    params.blue1,
+                    params.red2,
+                    params.green2,
+                    params.blue2,
+                ],
+            ),
+            StandardEffect::Static(params) => send_standard_effect(
+                "static".to_string(),
+                vec![params.red, params.green, params.blue],
+            ),
+            StandardEffect::Wave(params) => {
+                send_standard_effect("wave".to_string(), vec![params.direction])
+            }
+        },
+        Args::DeviceInfo => {
+            match razer_devices() {
+                Ok(devices) if devices.is_empty() => {
+                    println!("No razer devices found");
+                }
+                Ok(devices) => {
+                    println!("Found the following razer devices:");
+                    for device in devices{
+                        println!(
+                            "- {}:{} {}",
+                            device.vendor_id,
+                            device.product_id,
+                            device.name
+                        );
+                    }
+                }
+                Err(error) => {
+                    println!("Failed to get device info: {error}");
+                }
+            }
+        }
+    }
+}
+
+fn validate_and_write_bho(threshold: Option<u8>, state: OnOff) {
+    match threshold {
+        Some(threshold) => {
+            if !valid_bho_threshold(threshold) {
+                Cli::command()
+                    .error(
+                        ErrorKind::InvalidValue,
+                        "Threshold must be multiple of 5 between 50 and 80",
+                    )
+                    .exit()
+            }
+            write_bho(state.is_on(), threshold)
+        }
+        None => {
+            if state.is_on() {
+                Cli::command()
+                    .error(
+                        ErrorKind::MissingRequiredArgument,
+                        "Threshold is required when BHO is on",
+                    )
+                    .exit()
+            }
+            write_bho(state.is_on(), 80)
+        }
+    }
+}
+
+fn write_light_control(enable: bool) {
+    match send_data(comms::DaemonCommand::SetEnableLightControl { enable }) {
+        Some(_) => read_light_control(),
+        None => eprintln!("Unknown error!"),
+    }
+}
+
+fn read_bho() {
+    send_data(comms::DaemonCommand::GetBatteryHealthOptimizer()).map_or_else(
+        || eprintln!("Unknown error occured when getting bho"),
+        |result| {
+            if let comms::DaemonResponse::GetBatteryHealthOptimizer { is_on, threshold } = result {
+                match is_on {
+                    true => {
+                        println!(
+                            "Battery health optimization is on with a threshold of {}",
+                            threshold
+                        );
+                    }
+                    false => {
+                        eprintln!("Battery health optimization is off");
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn read_light_control() {
+    send_data(comms::DaemonCommand::GetEnableLightControl).map_or_else(
+        || eprintln!("Unknown error occured when reading light control"),
+        |result| {
+            if let comms::DaemonResponse::GetEnableLightControl { enabled } = result {
+                match enabled {
+                    true => println!("Light Control is enabled"),
+                    false => println!("Light Control is disabled")
+                }
+            }
+        },
+    );
+}
+
+fn write_bho(on: bool, threshold: u8) {
+    if !on {
+        bho_toggle_off();
+        return;
+    }
+
+    bho_toggle_on(threshold);
+}
+
+fn bho_toggle_on(threshold: u8) {
+    if !valid_bho_threshold(threshold) {
+        eprintln!("Threshold value must be a multiple of five between 50 and 80");
+        return;
+    }
+
+    send_data(comms::DaemonCommand::SetBatteryHealthOptimizer {
+        is_on: true,
+        threshold,
+    })
+    .map_or_else(
+        || eprintln!("Unknown error occured when toggling bho"),
+        |result| {
+            if let comms::DaemonResponse::SetBatteryHealthOptimizer { result } = result {
+                match result {
+                    true => {
+                        println!(
+                            "Battery health optimization is on with a threshold of {}",
+                            threshold
+                        );
+                    }
+                    false => {
+                        eprintln!("Failed to turn on bho with threshold of {}", threshold);
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn valid_bho_threshold(threshold: u8) -> bool {
+    if threshold % 5 != 0 {
+        return false;
+    }
+
+    if !(50..=80).contains(&threshold) {
+        return false;
+    }
+
+    true
+}
+
+fn bho_toggle_off() {
+    send_data(comms::DaemonCommand::SetBatteryHealthOptimizer {
+        is_on: false,
+        threshold: 80,
+    })
+    .map_or_else(
+        || eprintln!("Unknown error occured when toggling bho"),
+        |result| {
+            if let comms::DaemonResponse::SetBatteryHealthOptimizer { result } = result {
+                match result {
+                    true => {
+                        println!("Successfully turned off bho");
+                    }
+                    false => {
+                        eprintln!("Failed to turn off bho");
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn send_standard_effect(name: String, params: Vec<u8>) {
+    match send_data(comms::DaemonCommand::SetStandardEffect { name, params }) {
+        Some(comms::DaemonResponse::SetStandardEffect { result }) => {
+            if result {
+                println!("Effect set OK!");
+            } else {
+                eprintln!("Effect set FAIL!");
+            }
+        },
+        Some(_) => eprintln!("Unexpected response from daemon!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn send_effect(name: String, params: Vec<u8>) {
+    match send_data(comms::DaemonCommand::SetEffect { name, params }) {
+        Some(comms::DaemonResponse::SetEffect { result }) => {
+            if result {
+                println!("Effect set OK!");
+            } else {
+                eprintln!("Effect set FAIL!");
+            }
+        },
+        Some(_) => eprintln!("Unexpected response from daemon!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
+    match comms::bind() {
+        Some(socket) => comms::send_to_daemon(opt, socket),
+        None => {
+            eprintln!("Error. Cannot bind to socket");
+            None
+        },
+    }
+}
+
+fn read_fan_rpm(ac: usize) {
+    match send_data(comms::DaemonCommand::GetFanSpeed { ac }) {
+        Some(comms::DaemonResponse::GetFanSpeed { rpm }) => {
+            let rpm_desc: String = match rpm {
+                f if f < 0 => String::from("Unknown"),
+                0 => String::from("Auto (0)"),
+                _ => format!("{} RPM", rpm),
+            };
+            println!("Current fan setting: {}", rpm_desc);
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn read_logo_mode(ac: usize) {
+    match send_data(comms::DaemonCommand::GetLogoLedState { ac }) {
+        Some(comms::DaemonResponse::GetLogoLedState { logo_state }) => {
+            let logo_state_desc: &str = match logo_state {
+                0 => "Off",
+                1 => "On",
+                2 => "Breathing",
+                _ => "Unknown",
+            };
+            println!("Current logo setting: {}", logo_state_desc);
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn read_power_mode(ac: usize) {
+    if let Some(resp) = send_data(comms::DaemonCommand::GetPwrLevel { ac }) {
+        if let comms::DaemonResponse::GetPwrLevel { pwr } = resp {
+            let power_desc: &str = match pwr {
+                0 => "Balanced",
+                1 => "Gaming",
+                2 => "Creator",
+                3 => "Silent",
+                4 => "Custom",
+                _ => "Unknown",
+            };
+            println!("Current power setting: {}", power_desc);
+            if pwr == 4 {
+                if let Some(resp) = send_data(comms::DaemonCommand::GetCPUBoost { ac }) {
+                    if let comms::DaemonResponse::GetCPUBoost { cpu } = resp {
+                        let cpu_boost_desc: &str = match cpu {
+                            0 => "Low",
+                            1 => "Medium",
+                            2 => "High",
+                            3 => "Boost",
+                            _ => "Unknown",
+                        };
+                        println!("Current CPU setting: {}", cpu_boost_desc);
+                    };
+                }
+                if let Some(resp) = send_data(comms::DaemonCommand::GetGPUBoost { ac }) {
+                    if let comms::DaemonResponse::GetGPUBoost { gpu } = resp {
+                        let gpu_boost_desc: &str = match gpu {
+                            0 => "Low",
+                            1 => "Medium",
+                            2 => "High",
+                            _ => "Unknown",
+                        };
+                        println!("Current GPU setting: {}", gpu_boost_desc);
+                    };
+                }
+            }
+        } else {
+            eprintln!("Daemon responded with invalid data!");
+        }
+    }
+}
+
+fn write_pwr_mode(ac: usize, pwr_mode: u8, cpu_mode: Option<u8>, gpu_mode: Option<u8>) {
+    if pwr_mode > 4 {
+        Cli::command()
+            .error(ErrorKind::InvalidValue, "Power mode must be 0, 1, 2, 3 or 4")
+            .exit()
+    }
+
+    let cm = if pwr_mode == 4 {
+        cpu_mode.expect("CPU mode must be provided when power mode is 4")
+    } else {
+        cpu_mode.unwrap_or(0)
+    };
+
+    if cm > 3 {
+        Cli::command()
+            .error(ErrorKind::InvalidValue, "CPU mode must be between 0 and 3")
+            .exit()
+    }
+
+    let gm = if pwr_mode == 4 {
+        gpu_mode.expect("GPU mode must be provided when power mode is 4")
+    } else {
+        gpu_mode.unwrap_or(0)
+    };
+
+    if gm > 2 {
+        Cli::command()
+            .error(ErrorKind::InvalidValue, "GPU mode must be between 0 and 2")
+            .exit()
+    }
+
+    match send_data(comms::DaemonCommand::SetPowerMode {
+        ac,
+        pwr: pwr_mode,
+        cpu: cm,
+        gpu: gm,
+    }) {
+        Some(_) => read_power_mode(ac),
+        None => {
+            Cli::command()
+                .error(
+                    ErrorKind::DisplayHelp,
+                    "An error occurred while sending the command to the daemon",
+                )
+                .exit()
+        },
+    }
+}
+
+fn read_brightness(ac: usize) {
+    match send_data(comms::DaemonCommand::GetBrightness { ac }) {
+        Some(comms::DaemonResponse::GetBrightness { result }) => {
+            println!("Current brightness: {}", result);
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn read_sync() {
+    match send_data(comms::DaemonCommand::GetSync()) {
+        Some(comms::DaemonResponse::GetSync { sync }) => {
+            println!("Current sync: {:?}", sync);
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn write_brightness(ac: usize, val: u8) {
+    match send_data(comms::DaemonCommand::SetBrightness { ac, val }) {
+        Some(_) => read_brightness(ac),
+        None => eprintln!("Unknown error!"),
+    }
+}
+
+fn write_fan_speed(ac: usize, x: i32) {
+    match send_data(comms::DaemonCommand::SetFanSpeed { ac, rpm: x }) {
+        Some(_) => read_fan_rpm(ac),
+        None => eprintln!("Unknown error!"),
+    }
+}
+
+fn write_logo_mode(ac: usize, x: u8) {
+    match send_data(comms::DaemonCommand::SetLogoLedState { ac, logo_state: x }) {
+        Some(_) => read_logo_mode(ac),
+        None => eprintln!("Unknown error!"),
+    }
+}
+
+fn write_sync(sync: bool) {
+    match send_data(comms::DaemonCommand::SetSync { sync }) {
+        Some(_) => read_sync(),
+        None => eprintln!("Unknown error!"),
+    }
+}

@@ -1,0 +1,10 @@
+[Unit]
+Description=Razer Blade fan and power control
+After=graphical-session.target
+PartOf=graphical-session.target
+[Service]
+ExecStart=%h/.local/bin/razercontrol-daemon
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=graphical-session.target

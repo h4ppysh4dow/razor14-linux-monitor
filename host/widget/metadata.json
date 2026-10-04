@@ -1,0 +1,1 @@
+{"KPackageStructure": "Plasma/Applet", "KPlugin": {"Id": "local.razor14.history", "Name": "Blade Temperatur und L\u00fcfter", "Description": "GPU-Energiestatus und L\u00fcftersteuerung", "Version": "1.5", "License": "MIT", "Icon": "preferences-system-power-management", "Authors": [{"Name": "Local configuration"}]}, "X-Plasma-API-Minimum-Version": "6.0"}

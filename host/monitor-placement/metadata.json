@@ -1,0 +1,1 @@
+{"KPlugin":{"Id":"rhinux-monitor-placement","Name":"Razer monitor placement","Description":"Keep the Razer monitor at the top right","Version":"1.0"},"KPackageStructure":"KWin/Script","X-Plasma-API":"javascript","X-Plasma-MainScript":"code/main.js"}

@@ -1,0 +1,148 @@
+#!/usr/bin/python3
+"""Restricted local full-save controller for razor14; no arbitrary commands."""
+import json, os, pwd, signal, socket, struct, subprocess, sys, time
+from pathlib import Path
+SOCK='/run/razor14-power/control.sock'
+STATE=Path('/var/lib/razor14-power/previous.json')
+GPU=Path('/sys/bus/pci/devices/0000:01:00.0')
+
+def read(p):
+ try:return Path(p).read_text().strip()
+ except OSError:return ''
+def battery():
+ values=[read(p) for p in Path('/sys/class/power_supply').glob('*/online')]
+ return bool(values) and all(v=='0' for v in values)
+def run(*args):
+ r=subprocess.run(args,capture_output=True,text=True,timeout=12)
+ if r.returncode:raise RuntimeError((r.stderr or r.stdout).strip()[:250])
+ return r.stdout.strip()
+def cw(*args):return run('/usr/bin/cardwire',*args)
+def profile(value=None):
+ from gi.repository import Gio,GLib
+ n='org.freedesktop.UPower.PowerProfiles';p='/org/freedesktop/UPower/PowerProfiles'
+ bus=Gio.bus_get_sync(Gio.BusType.SYSTEM,None)
+ method='Get' if value is None else 'Set'
+ args=GLib.Variant('(ss)',(n,'ActiveProfile')) if value is None else GLib.Variant('(ssv)',(n,'ActiveProfile',GLib.Variant('s',value)))
+ result=bus.call_sync(n,p,'org.freedesktop.DBus.Properties',method,args,None,Gio.DBusCallFlags.NONE,5000,None)
+ return result.unpack()[0] if value is None else None
+
+def restore():
+ if not STATE.exists():return
+ saved=json.loads(STATE.read_text())
+ # Keep recovery data until both independent changes have been reversed.
+ errors=[]
+ try:cw('set','hybrid')
+ except Exception as e:errors.append(str(e))
+ try:
+  if profile()=='power-saver':profile(saved['profile'])
+ except Exception as e:errors.append(str(e))
+ if errors:raise RuntimeError('; '.join(errors))
+ STATE.unlink()
+
+class Controller:
+ def __init__(self):
+  self.error='';self.started=0;self.fds={}
+  restore()
+  # Full save is deliberately not remembered across daemon/OS restarts.
+  cw('set','hybrid')
+ def close_reads(self):
+  for f in self.fds.values():f.close()
+  self.fds={}
+ def stop(self):
+  restore();self.close_reads();self.started=0
+ def start(self):
+  if STATE.exists():return
+  if not battery():raise RuntimeError('Full save nur im Akkubetrieb.')
+  devices=json.loads(cw('list','--json'))
+  target=[v for v in devices.values() if v['pci']=='0000:01:00.0']
+  if len(target)!=1 or target[0]['default']:raise RuntimeError('RTX-Zuordnung nicht sicher.')
+  for f in GPU.glob('drm/card*/card*-*/status'):
+   if read(f)=='connected':raise RuntimeError('RTX-Monitor zuerst trennen.')
+  # These read-only descriptors remain usable while Cardwire hides new opens.
+  paths={'gpu':GPU/'power_state','audio':Path('/sys/bus/pci/devices/0000:01:00.1/power_state'),'vram':Path('/proc/driver/nvidia/gpus/0000:01:00.0/power')}
+  self.close_reads()
+  try:
+   for key,path in paths.items():self.fds[key]=path.open()
+  except Exception:
+   self.close_reads();raise RuntimeError('GPU-Stromzustand nicht lesbar.')
+  old=profile()
+  if old not in ('balanced','performance','power-saver'):raise RuntimeError('Unbekanntes CPU-Profil.')
+  STATE.parent.mkdir(parents=True,exist_ok=True)
+  temp=STATE.with_suffix('.tmp');temp.write_text(json.dumps({'profile':old}));temp.replace(STATE)
+  try:
+   profile('power-saver')
+   cw('config','experimental-nvidia-block','true')
+   cw('config','battery-auto-switch','false')
+   cw('config','external-display-auto-switch','false')
+   cw('set','integrated');self.started=time.monotonic()
+  except Exception:
+   self.stop();raise
+ def sample(self,key):
+  try:
+   f=self.fds[key];f.seek(0);return f.read().strip()
+  except (OSError,KeyError):return ''
+ def status(self):
+  requested=STATE.exists()
+  if requested and (not battery() or profile()!='power-saver'):
+   self.stop();requested=False
+  policies=list(Path('/sys/devices/system/cpu/cpufreq').glob('policy*'))
+  cpu=bool(policies) and all(read(p/'boost')=='0' and read(p/'energy_performance_preference')=='power' for p in policies)
+  active=False;pending=False;note=self.error
+  if requested:
+   devices=json.loads(cw('list','--json'))
+   blocked=any(v['pci']=='0000:01:00.0' and v['blocked'] for v in devices.values())
+   off=self.sample('gpu')=='D3cold' and self.sample('audio')=='D3cold'
+   vram=any(l.startswith('Video Memory:') and l.split(':',1)[1].strip()=='Off' for l in self.sample('vram').splitlines())
+   active=cpu and blocked and off and vram
+   pending=not active
+   if not blocked:
+    self.stop();requested=False;pending=False;note='GPU-Sperre aufgehoben; auto wiederhergestellt.'
+   elif pending:
+    note='Full save wird aktiviert …' if time.monotonic()-self.started<45 else 'RTX noch aktiv: GPU-Anwendungen schließen.'
+  return dict(active=active,requested=requested,pending=pending,cpu_ok=cpu,battery=battery(),error=note,available=True)
+
+def serve():
+ user=pwd.getpwnam(os.environ['RAZOR14_USER']);ctrl=Controller()
+ server=socket.socket(socket.AF_UNIX)
+ Path(SOCK).unlink(missing_ok=True);server.bind(SOCK);os.chown(SOCK,0,user.pw_gid);os.chmod(SOCK,0o660)
+ server.listen(4);server.settimeout(1);running=True;last=0
+ def quit(*_):
+  nonlocal running
+  running=False
+ signal.signal(signal.SIGTERM,quit);signal.signal(signal.SIGINT,quit)
+ try:
+  while running:
+   if time.monotonic()-last>=10:
+    try:ctrl.status()
+    except Exception as e:ctrl.error=str(e)
+    last=time.monotonic()
+   try:conn,_=server.accept()
+   except socket.timeout:continue
+   with conn:
+    conn.settimeout(2)
+    try:
+     _,uid,_=struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+     if uid not in (0,user.pw_uid):raise RuntimeError('Zugriff verweigert.')
+     command=conn.recv(32).decode().strip()
+     if command in ('save','auto'):
+      ctrl.error='';(ctrl.start if command=='save' else ctrl.stop)()
+     elif command!='status':raise RuntimeError('Ungültiger Befehl.')
+     result=ctrl.status()
+    except Exception as e:
+     result=dict(active=False,requested=STATE.exists(),available=True,error=str(e))
+    try:conn.sendall(json.dumps(result).encode())
+    except OSError:pass
+ finally:
+  ctrl.stop();server.close();Path(SOCK).unlink(missing_ok=True)
+
+if __name__=='__main__':
+ command=sys.argv[1] if len(sys.argv)>1 else 'status'
+ if command in ('serve','recover'):
+  if os.geteuid()!=0:raise SystemExit('Root erforderlich.')
+  serve() if command=='serve' else restore()
+ else:
+  try:
+   with socket.socket(socket.AF_UNIX) as s:
+    s.settimeout(60);s.connect(SOCK);s.sendall(command.encode());print(s.recv(65536).decode())
+  except OSError:
+   print(json.dumps(dict(active=False,requested=False,available=False,error='Full-save-Dienst noch nicht eingerichtet.')))
